@@ -6,9 +6,11 @@
 
 - **포트폴리오 관리**: 관심 종목(종목코드 6자리) 등록/삭제
 - **내부자 매수 모니터링**: OpenDART elestock API를 통해 임원/주요주주의 주식 보유 증가 감지
-- **이메일 알림**: 내부자 매수 발생 시 Gmail로 알림 발송
 - **자동 수집**: Vercel Cron을 통해 매일 아침 07:30(KST) 자동 실행
-- **웹 대시보드**: 최근 내부자 매수 이벤트 조회
+- **수동 수집**: 대시보드에서 "매수내역 감시 개시" 버튼으로 즉시 수집 (5분 쿨다운)
+- **이메일 알림**: 자동 수집 시 신규 이벤트 발생하면 Gmail로 알림 발송
+- **웹 대시보드**: 최근 내부자 매수 이벤트 조회 및 실시간 수집 상태 표시
+- **중복 방지**: 동일 공시는 재수집/재발송 안됨 (Idempotent)
 
 ## Tech Stack
 
@@ -100,9 +102,20 @@ http://localhost:3000 에서 확인합니다.
 2. 종목코드 6자리 입력 (예: 005930 삼성전자)
 3. "추가" 버튼 클릭
 
-### 수동 배치 실행
+### 수동 수집
 
+**방법 1: 웹 대시보드 (권장)**
+1. 메인 대시보드에서 "🔍 매수내역 감시 개시" 버튼 클릭
+2. OpenDART API 호출 → 신규 이벤트 자동 저장
+3. 토스트 알림으로 결과 확인 (신규 이벤트 수, 처리 종목 수)
+4. 5분 쿨다운 후 재사용 가능
+
+**방법 2: API 직접 호출**
 ```bash
+# 수동 수집 (이메일 발송 안됨)
+curl -X POST http://localhost:3000/api/manual-collect
+
+# 자동 수집 (이메일 발송됨)
 curl http://localhost:3000/api/cron/collect \
   -H "Authorization: Bearer YOUR_CRON_SECRET"
 ```
@@ -138,40 +151,69 @@ UTC 22:30 = KST 07:30 (매일 아침)
 
 ## API Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/portfolio` | GET | 포트폴리오 목록 조회 |
-| `/api/portfolio` | POST | 종목 추가 |
-| `/api/portfolio?stock_code=` | DELETE | 종목 삭제 |
-| `/api/events` | GET | 내부자 매수 이벤트 조회 |
-| `/api/cron/collect` | GET | 배치 수집 실행 |
-| `/api/admin/import-corp` | POST | 회사 코드 import |
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/api/portfolio` | GET | - | 포트폴리오 목록 조회 |
+| `/api/portfolio` | POST | - | 종목 추가 |
+| `/api/portfolio?stock_code=` | DELETE | - | 종목 삭제 |
+| `/api/events` | GET | - | 내부자 매수 이벤트 조회 |
+| `/api/manual-collect` | POST | - | 수동 수집 (이메일 X) |
+| `/api/cron/collect` | GET | Bearer Token | 자동 수집 (이메일 O) |
+| `/api/admin/import-corp` | POST | Bearer Token | 회사 코드 import |
 
 ## Project Structure
 
 ```
 src/
 ├── app/
-│   ├── page.tsx                 # 메인 대시보드
-│   ├── portfolio/page.tsx       # 포트폴리오 관리
+│   ├── page.tsx                     # 메인 대시보드 (수동 수집 UI 포함)
+│   ├── portfolio/page.tsx           # 포트폴리오 관리
 │   └── api/
-│       ├── portfolio/route.ts   # 포트폴리오 CRUD
-│       ├── events/route.ts      # 이벤트 조회
-│       ├── cron/collect/route.ts # 배치 수집
+│       ├── portfolio/route.ts       # 포트폴리오 CRUD
+│       ├── events/route.ts          # 이벤트 조회
+│       ├── manual-collect/route.ts  # 수동 수집 (NEW)
+│       ├── cron/collect/route.ts    # 자동 수집
 │       └── admin/import-corp/route.ts
 ├── lib/
-│   ├── supabase/server.ts       # Supabase 클라이언트
+│   ├── collector/index.ts           # 공통 수집 로직 (NEW)
+│   ├── supabase/server.ts           # Supabase 클라이언트
 │   ├── opendart/
-│   │   ├── client.ts            # OpenDART API
-│   │   ├── types.ts             # 타입 정의
-│   │   └── parser.ts            # 데이터 파싱
-│   └── email/sender.ts          # 이메일 발송
+│   │   ├── client.ts                # OpenDART API
+│   │   ├── types.ts                 # 타입 정의
+│   │   └── parser.ts                # 데이터 파싱
+│   └── email/sender.ts              # 이메일 발송
 ├── components/
 │   ├── EventList.tsx
 │   ├── PortfolioForm.tsx
-│   └── PortfolioTable.tsx
-└── types/database.ts
+│   ├── PortfolioTable.tsx
+│   ├── Spinner.tsx                  # 로딩 스피너 (NEW)
+│   └── Toast.tsx                    # 알림 토스트 (NEW)
+└── types/
+    ├── database.ts
+    └── collect.ts                   # 수집 결과 타입 (NEW)
 ```
+
+## How It Works
+
+### 자동 수집 (매일 07:30 KST)
+1. Vercel Cron이 `/api/cron/collect` 호출
+2. 포트폴리오 종목 조회 → OpenDART API 호출
+3. 보유 증가(delta_cnt > 0) 이벤트만 필터링
+4. DB에 저장 (rcept_no 기준 중복 방지)
+5. 신규 이벤트가 1건 이상이면 이메일 발송
+
+### 수동 수집 (사용자 버튼 클릭)
+1. 대시보드에서 "매수내역 감시 개시" 버튼 클릭
+2. 실시간 프로그레스 표시 (종목 처리 진행률)
+3. 자동 수집과 동일한 로직 실행 (이메일 발송 제외)
+4. 토스트 알림으로 결과 표시
+5. 5분 쿨다운 타이머 시작
+
+### 중복 방지 메커니즘
+- **DB 레벨**: `rcept_no` UNIQUE 제약
+- **로직 레벨**: `ignoreDuplicates: true` 옵션
+- **날짜 필터**: `rcept_dt === todayStr` 체크
+- 동일 공시는 여러 번 수집해도 재저장/재발송 안됨 ✅
 
 ## OpenDART Status Codes
 
